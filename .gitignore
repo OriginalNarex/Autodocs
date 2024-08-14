@@ -1,0 +1,160 @@
+import disnake
+from disnake.ext import commands
+from disnake import ButtonStyle, SelectOption
+from disnake.ui import Button, View, Select
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+SCOPES = ['https://www.googleapis.com/auth/drive']
+SERVICE_ACCOUNT_FILE = './credentials.json'
+
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=creds)
+
+intents = disnake.Intents.default()
+intents.message_content = True  #
+bot = commands.InteractionBot(intents=intents)
+
+ADMIN_CHANNEL_ID = 1273336396446306474
+
+@bot.event
+async def on_ready():
+    print(f"Бот {bot.user} успешно запущен!")
+
+def get_drive_folders():
+    try:
+        query = "mimeType='application/vnd.google-apps.folder'"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        items = results.get('files', [])
+        return items
+    except HttpError as error:
+        print(f"Произошла ошибка при получении списка папок: {error}")
+        return []
+
+@bot.slash_command(description="Запросить доступ к папке на Google Drive")
+async def request_access(interaction: disnake.ApplicationCommandInteraction, npz: str , user_email: str):
+    folders = get_drive_folders()
+
+    if not folders:
+        await interaction.response.send_message("Не удалось получить список папок.", ephemeral=True)
+        return
+
+    options = [SelectOption(label=folder['name'], value=folder['id']) for folder in folders]
+
+    select = Select(
+        placeholder="Выберите папку для доступа",
+        options=options
+    )
+
+    view = View()
+    view.add_item(select)
+
+    await interaction.response.send_message("Выберите папку, к которой хотите запросить доступ:", view=view, ephemeral=True)
+
+    async def select_callback(inter_select: disnake.MessageInteraction):
+        folder_id = inter_select.values[0]
+        folder_name = next(folder['name'] for folder in folders if folder['id'] == folder_id)
+
+        approve_button = Button(label="Одобрить доступ", style=ButtonStyle.green)
+        deny_button = Button(label="Отклонить", style=ButtonStyle.red)
+
+        admin_view = View()
+        admin_view.add_item(approve_button)
+        admin_view.add_item(deny_button)
+
+        admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        if admin_channel:
+            admin_message = await admin_channel.send(
+                f"``` Боец [{npz}]\n "
+                f"Запросил доступ к папке [{folder_name}]``` \n"
+                f"### Почта(кликните копировать как сообщение) \n"
+                f"```{user_email}```\n",
+                view=admin_view
+            )
+
+            await inter_select.response.send_message(f"Запрос на доступ к папке '{folder_name}' отправлен на рассмотрение.", ephemeral=True)
+
+            async def approve_callback(inter_button: disnake.MessageInteraction):
+                if not inter_button.user.guild_permissions.administrator:
+                    await inter_button.response.send_message("У вас нет прав для одобрения этого запроса.", ephemeral=True)
+                    return
+
+                try:
+                    user_permission = {
+                        'type': 'user',
+                        'role': 'reader',
+                        'emailAddress': user_email
+                    }
+                    drive_service.permissions().create(
+                        fileId=folder_id,
+                        body=user_permission,
+                        fields='id',
+                    ).execute()
+
+                    await inter_button.response.send_message(f"Доступ к папке '{folder_name}' предоставлен для {user_email}.", ephemeral=True)
+
+                    await admin_message.edit(view=None)
+
+                except HttpError as error:
+                    await inter_button.response.send_message(f"Произошла ошибка при предоставлении доступа: {error}", ephemeral=True)
+
+            async def deny_callback(inter_button: disnake.MessageInteraction):
+                if not inter_button.user.guild_permissions.administrator:
+                    await inter_button.response.send_message("У вас нет прав для отклонения этого запроса.", ephemeral=True)
+                    return
+
+                await inter_button.response.send_message(f"Запрос на доступ к папке '{folder_name}' отклонен.", ephemeral=True)
+                await admin_message.edit(view=None)
+
+            approve_button.callback = approve_callback
+            deny_button.callback = deny_callback
+
+        else:
+            await inter_select.response.send_message("Не удалось найти канал администрации для отправки запроса.", ephemeral=True)
+
+    select.callback = select_callback
+
+@bot.slash_command(description="Удалить доступ к папке на Google Drive")
+@commands.has_guild_permissions(administrator=True)
+async def remove_access(interaction: disnake.ApplicationCommandInteraction, user_email: str):
+    folders = get_drive_folders()
+
+    if not folders:
+        await interaction.response.send_message("Не удалось получить список папок.", ephemeral=True)
+        return
+
+    options = [SelectOption(label=folder['name'], value=folder['id']) for folder in folders]
+
+    select = Select(
+        placeholder="Выберите папку для удаления доступа",
+        options=options
+    )
+
+    view = View()
+    view.add_item(select)
+
+    await interaction.response.send_message("Выберите папку, из которой хотите удалить доступ:", view=view, ephemeral=True)
+
+    async def select_callback(inter_select: disnake.MessageInteraction):
+        folder_id = inter_select.values[0]
+        folder_name = next(folder['name'] for folder in folders if folder['id'] == folder_id)
+
+        try:
+            permissions = drive_service.permissions().list(fileId=folder_id, fields='permissions(id, emailAddress)').execute()
+            permissions = permissions.get('permissions', [])
+
+            permission_id = next((perm['id'] for perm in permissions if perm['emailAddress'] == user_email), None)
+
+            if permission_id:
+                drive_service.permissions().delete(fileId=folder_id, permissionId=permission_id).execute()
+                await inter_select.response.send_message(f"Доступ для {user_email} был удален из папки '{folder_name}'.", ephemeral=True)
+            else:
+                await inter_select.response.send_message(f"Не найдено доступа для {user_email} в папке '{folder_name}'.", ephemeral=True)
+
+        except HttpError as error:
+            await inter_select.response.send_message(f"Произошла ошибка при удалении доступа: {error}", ephemeral=True)
+
+    select.callback = select_callback
+
+bot.run('TOKEN')
